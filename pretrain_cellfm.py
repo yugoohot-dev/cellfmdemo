@@ -2,7 +2,6 @@ import scanpy as sc
 import os
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch import optim
 from torch.cuda.amp import GradScaler
 from torch.utils.data import Dataset
@@ -13,6 +12,7 @@ import argparse
 from tqdm import tqdm
 import pickle
 import warnings
+import pandas as pd
 import matplotlib.pyplot as plt
 
 warnings.filterwarnings("ignore")
@@ -24,21 +24,17 @@ from model import Cell_FM
 class CrossSpeciesSCrna(Dataset):
     def __init__(self, adata):
         self.adata = adata
-        # 确保使用 CSR 稀疏矩阵加速按行读取
         if not sp.issparse(self.adata.X):
             self.adata.X = sp.csr_matrix(self.adata.X)
         self.T = np.asarray(self.adata.X.sum(1)).ravel()
-        # [关键] 直接使用我们的跨物种 Token ID (0 到 50557) 作为特征索引
         self.gene = np.arange(self.adata.n_vars, dtype=np.int32)
 
     def __len__(self):
         return self.adata.n_obs
 
     def __getitem__(self, idx):
-        # 提取细胞的全量 5 万维特征交由底层的 Prepare 类去动态截断/遮盖
         data = self.adata.X[idx].toarray().ravel().astype(np.float32)
         T = np.asarray(self.T[idx], dtype=np.float32)
-        # 占位下游不用的分类 label 和 batch
         return data, self.gene, T, 0, 0, 0.0
 
 # ==========================================
@@ -121,7 +117,7 @@ def build_prior_knowledge_matrix(token_dict, prior_dir, vocab_size, id_to_name):
     return prior_matrix
 
 # ==========================================
-# 3. 拦截式先验知识融合包装器
+# 3. 拦截式先验知识融合包装器 
 # ==========================================
 class PriorAugmentedEmbedding(nn.Module):
     def __init__(self, orig_tensor, prior_matrix, enc_dims):
@@ -140,8 +136,11 @@ class PriorAugmentedEmbedding(nn.Module):
 # 4. 扩容与外挂融合模型
 # ==========================================
 class CrossSpecies_Cell_FM(Cell_FM):
-    def __init__(self, n_gene, cfg, ckpt_path=None, device=None):
+    # [修改] 增加 token_dict 和 symbol_to_id，用于精确权重寻址
+    def __init__(self, n_gene, cfg, ckpt_path=None, device=None, token_dict=None, symbol_to_id=None):
         super().__init__(n_gene, cfg, ckpt_path, device)
+        self.token_dict = token_dict
+        self.symbol_to_id = symbol_to_id
         
     def load_weight_and_surgery(self, prior_matrix):
         import mindspore as ms
@@ -157,9 +156,29 @@ class CrossSpecies_Cell_FM(Cell_FM):
         if "gene_emb" in torch_state_dict:
             old_emb = torch_state_dict["gene_emb"]
             new_emb = self.net.gene_emb.data 
-            copy_len = min(old_emb.shape[0], new_emb.shape[0])
-            new_emb[:copy_len, :] = old_emb[:copy_len, :]
-            print(f"[Surgery] Transferred {copy_len} base gene embeddings.")
+            
+            # [核心修复] 精确词表对齐映射
+            matched_weights = 0
+            csv_path = 'csv/expand_gene_info.csv'
+            if os.path.exists(csv_path):
+                cellfm_gene_info = pd.read_csv(csv_path, index_col=0, header=0)
+                cellfm_geneset = {str(j).upper(): i + 1 for i, j in enumerate(cellfm_gene_info.index)}
+                
+                for cellfm_symbol, cellfm_id in cellfm_geneset.items():
+                    if cellfm_id >= old_emb.shape[0]: continue
+                    ensembl_id = self.symbol_to_id.get(cellfm_symbol, cellfm_symbol)
+                    
+                    if ensembl_id in self.token_dict:
+                        new_token_id = self.token_dict[ensembl_id]
+                        if new_token_id < new_emb.shape[0]:
+                            new_emb[new_token_id, :] = old_emb[cellfm_id, :]
+                            matched_weights += 1
+                print(f"[Surgery] Precise Vocabulary Alignment: Transferred {matched_weights} gene embeddings safely.")
+            else:
+                print("WARNING: expand_gene_info.csv NOT FOUND! Using sequential copy.")
+                copy_len = min(old_emb.shape[0], new_emb.shape[0])
+                new_emb[:copy_len, :] = old_emb[:copy_len, :]
+                
             del torch_state_dict["gene_emb"]
 
         self.net.load_state_dict(torch_state_dict, strict=False)
@@ -174,50 +193,6 @@ class CrossSpecies_Cell_FM(Cell_FM):
         ).to(self.cfg.device)
         print("[Surgery] Prior Knowledge mapping network successfully attached.")
 
-    def forward(self, raw_nzdata, dw_nzdata, ST_feat, nonz_gene, mask_gene, zero_idx):
-        emb, gene_emb = self.net.encode(dw_nzdata, nonz_gene, ST_feat, zero_idx)
-        cls_token, st_emb, expr_emb = emb[:, 0], emb[:, 1:3], emb[:, 3:]
-
-        if self.net.add_zero:
-            gw_pred, z_prob1 = self.net.value_dec(expr_emb)
-            cw_pred, z_prob2 = self.net.cellwise_dec(cls_token, gene_emb)
-        else:
-            gw_pred = self.net.value_dec(expr_emb)
-            cw_pred = self.net.cellwise_dec(cls_token, gene_emb)
-
-        loss1 = self.net.reconstruct1(gw_pred, raw_nzdata, mask_gene)
-        loss2 = self.net.reconstruct2(cw_pred, raw_nzdata, mask_gene)
-        total_loss = loss1 + loss2
-        
-        loss_dict = {
-            'MSE_Global': loss1,
-            'MSE_Cellwise': loss2,
-            'BCE_Global': torch.tensor(0.0, device=self.device),
-            'BCE_Cellwise': torch.tensor(0.0, device=self.device),
-            'ECS_Regularization': torch.tensor(0.0, device=self.device)
-        }
-
-        if self.net.training and self.net.add_zero:
-            nonz_pos = zero_idx
-            loss3 = self.net.bce_loss1(z_prob1, nonz_pos, mask_gene)
-            loss4 = self.net.bce_loss2(z_prob2, nonz_pos, mask_gene)
-            total_loss = total_loss + loss3 + loss4
-            loss_dict['BCE_Global'] = loss3
-            loss_dict['BCE_Cellwise'] = loss4
-
-        if self.net.training and self.cfg.ecs:
-            cell_emb_normed = F.normalize(cw_pred, p=2, dim=1)
-            cos_sim = torch.matmul(cell_emb_normed, cell_emb_normed.transpose(0, 1))
-            eye_mask = torch.eye(cos_sim.size(0), device=cos_sim.device, dtype=cos_sim.dtype)
-            cos_sim = cos_sim * (1 - eye_mask)
-            cos_sim = F.relu(cos_sim)
-            loss5 = torch.mean(1 - (cos_sim - self.net.ecs_threshold) ** 2)
-            total_loss += loss5
-            loss_dict['ECS_Regularization'] = loss5
-
-        loss_dict['Total_Loss'] = total_loss
-        return total_loss, cls_token, loss_dict
-
 # ==========================================
 # 5. 主预训练流程
 # ==========================================
@@ -226,7 +201,7 @@ def pretrain(args):
     cfg.ecs = True
     cfg.ecs_threshold = 0.8
     cfg.add_zero = True
-    cfg.pad_zero = False
+    cfg.pad_zero = True
     
     cfg.use_bs = args.batch_size
     cfg.mask_ratio = 0.20 
@@ -255,7 +230,7 @@ def pretrain(args):
     adata = read_h5ad(args.data_path)
     adata = align_cross_species_adata(adata, token_dict, base_vocab_size, symbol_to_id)
     
-    # [核心修复]: 使用我们强大的自定义数据集类，避开底层残次逻辑
+    # [核心修复] 使用自定义数据集类，保留全长跨物种特征矩阵
     dataset = CrossSpeciesSCrna(adata)
     
     prep = Prepare(cfg.nonz_len, pad=0, mask_ratio=cfg.mask_ratio)
@@ -263,10 +238,12 @@ def pretrain(args):
     
     prior_matrix = build_prior_knowledge_matrix(token_dict, args.prior_dir, cfg.n_genes, id_to_name)
     
-    net = CrossSpecies_Cell_FM(cfg.n_genes, cfg, ckpt_path=cfg.ckpt_path, device=cfg.device) 
+    # 初始化模型时传入字典
+    net = CrossSpecies_Cell_FM(cfg.n_genes, cfg, ckpt_path=cfg.ckpt_path, device=cfg.device, token_dict=token_dict, symbol_to_id=symbol_to_id) 
     net.load_weight_and_surgery(prior_matrix)  
     net = net.to(cfg.device)
     
+    # 静态先验知识矩阵不被解冻参与梯度计算
     for name, param in net.named_parameters():
         if "prior_matrix" in name:
             param.requires_grad = False
@@ -279,14 +256,8 @@ def pretrain(args):
     
     is_human = "human" in args.data_path.lower() 
 
-    loss_history = {
-        'Total_Loss': [],
-        'MSE_Global': [],
-        'MSE_Cellwise': [],
-        'BCE_Global': [],
-        'BCE_Cellwise': [],
-        'ECS_Regularization': []
-    }
+    # [新增] 收集 Loss 的列表
+    step_losses = []
 
     for epoch in range(cfg.epoch):
         net.train()
@@ -303,30 +274,27 @@ def pretrain(args):
             zero_idx = batch['zero_idx'].to(cfg.device)
 
             # ==========================================================
-            # [核心修复]：所有序列级 Tensor 必须同步平移，绝不能错位！
+            # [核心修复] 保证所有序列的严格平移对齐，防止 Loss 爆炸
             # ==========================================================
-            # 1. 平移输入序列 (Input)
             nonz_gene[:, 1:] = nonz_gene[:, :-1].clone()
             dw_nzdata[:, 1:] = dw_nzdata[:, :-1].clone()
             nonz_gene[:, 0] = HUMAN_TOKEN_ID if is_human else MOUSE_TOKEN_ID
             dw_nzdata[:, 0] = 1.0 
-            
-            # 2. 平移目标答案 (Ground Truth)
+
             raw_nzdata[:, 1:] = raw_nzdata[:, :-1].clone()
-            raw_nzdata[:, 0] = 1.0  # 设为1.0即可，因为下方的 mask 会把它屏蔽掉
-            
-            # 3. 平移损失计算掩码 (Loss Mask)
+            raw_nzdata[:, 0] = 1.0  
+
             mask_gene[:, 1:] = mask_gene[:, :-1].clone()
-            mask_gene[:, 0] = 0.0   # [关键] 告诉模型：不要对第0位的物种Token算MSE误差！
-            
-            # 4. 平移有效长度掩码 (Attention Pad Mask)
+            mask_gene[:, 0] = 0.0  
+
             zero_idx[:, 1:] = zero_idx[:, :-1].clone()
-            zero_idx[:, 0] = 1.0    # 第0位是真实的物种Token，不是为了凑齐2048补的0(Pad)
+            zero_idx[:, 0] = 1.0
             # ==========================================================
 
             optimizer.zero_grad()
             with torch.cuda.amp.autocast():
-                loss, cls_token, loss_dict = net(
+                # 这里只返回总 loss，使用最原生的极简模式
+                loss, cls_token = net(
                     raw_nzdata=raw_nzdata,
                     dw_nzdata=dw_nzdata,
                     ST_feat=ST_feat,
@@ -340,49 +308,40 @@ def pretrain(args):
             scaler.step(optimizer)
             scaler.update()
             
-            for k, v in loss_dict.items():
-                loss_history[k].append(v.item())
+            loss_val = loss.item()
+            step_losses.append(loss_val)
             
-            running_loss += loss.item()
-            progress.set_postfix(Total_Loss=running_loss/(step+1))
+            running_loss += loss_val
+            progress.set_postfix(Pretrain_Loss=running_loss/(step+1))
         
         scheduler.step()
         save_file = f"{MODEL_PATH}/cellfm_immune_multispecies_epoch_{epoch+1}.pth"
         torch.save(net.state_dict(), save_file)
         print(f"Model saved: {save_file}")
 
-    print("Generating comprehensive loss curve grid...")
-    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
-    fig.suptitle('Continual Pre-training Loss Components', fontsize=18)
-    axes = axes.flatten()
+    # ==========================================
+    # [新增] 绘制单条 Total Loss 曲线图
+    # ==========================================
+    print("Generating Total Loss curve...")
+    plt.figure(figsize=(10, 6))
+    
+    plt.plot(step_losses, alpha=0.3, color='#1f77b4', label='Step Total Loss')
+    
+    window_size = 50
+    if len(step_losses) > window_size:
+        smoothed_loss = np.convolve(step_losses, np.ones(window_size)/window_size, mode='valid')
+        plt.plot(np.arange(window_size-1, len(step_losses)), smoothed_loss, color='#d62728', linewidth=2, label=f'Smoothed Loss (Window={window_size})')
 
-    titles = ['Total_Loss', 'MSE_Global', 'MSE_Cellwise', 'BCE_Global', 'BCE_Cellwise', 'ECS_Regularization']
-    colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b']
-
-    window_size = 50 
-    for i, key in enumerate(titles):
-        ax = axes[i]
-        y_vals = loss_history[key]
-        
-        ax.plot(y_vals, alpha=0.3, color=colors[i])
-        
-        if len(y_vals) > window_size:
-            smoothed = np.convolve(y_vals, np.ones(window_size)/window_size, mode='valid')
-            x_vals = np.arange(window_size-1, len(y_vals))
-            ax.plot(x_vals, smoothed, color=colors[i], linewidth=2, label=f'Smoothed (W={window_size})')
-            
-        ax.set_title(key, fontsize=14)
-        ax.set_xlabel('Training Steps')
-        ax.set_ylabel('Loss Value')
-        ax.grid(True, linestyle='--', alpha=0.6)
-        if len(y_vals) > window_size:
-            ax.legend()
-
-    plt.tight_layout(rect=[0, 0, 1, 0.96])
-    plot_save_path = os.path.join(MODEL_PATH, 'pretrain_losses_grid.png')
+    plt.title('Continual Pre-training Total Loss', fontsize=14)
+    plt.xlabel('Training Steps', fontsize=12)
+    plt.ylabel('Loss Value', fontsize=12)
+    plt.legend()
+    plt.grid(True, linestyle='--', alpha=0.6)
+    
+    plot_save_path = os.path.join(MODEL_PATH, 'pretrain_total_loss_curve.png')
     plt.savefig(plot_save_path, dpi=300, bbox_inches='tight')
     plt.close()
-    print(f"All individual loss curves successfully saved to: {plot_save_path}")
+    print(f"Total Loss curve plot saved successfully to: {plot_save_path}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
