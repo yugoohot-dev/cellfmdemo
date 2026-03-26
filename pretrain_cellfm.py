@@ -38,7 +38,7 @@ class CrossSpeciesSCrna(Dataset):
         return data, self.gene, T, 0, 0, 0.0
 
 # ==========================================
-# 1. 跨物种基因对齐 (附带 Symbol->ID 翻译)
+# 1. 跨物种基因对齐  Symbol->ID 翻译)
 # ==========================================
 def align_cross_species_adata(adata, token_dict, base_vocab_size, symbol_to_id):
     print(f"Original adata shape: {adata.shape}")
@@ -55,6 +55,8 @@ def align_cross_species_adata(adata, token_dict, base_vocab_size, symbol_to_id):
             matched += 1
             
     print(f"Data Alignment: Matched {matched} out of {adata.n_vars} genes to unified vocabulary.")
+    print(new_X.shape)
+    print(new_X)
     new_adata = sc.AnnData(X=new_X.tocsr(), obs=adata.obs)
     new_adata.var_names = [str(i) for i in range(base_vocab_size)] 
     return new_adata
@@ -198,9 +200,9 @@ class CrossSpecies_Cell_FM(Cell_FM):
 # ==========================================
 def pretrain(args):
     cfg = Config_80M()
-    cfg.ecs = True
+    cfg.ecs = False
     cfg.ecs_threshold = 0.8
-    cfg.add_zero = True
+    cfg.add_zero = False
     cfg.pad_zero = True
     
     cfg.use_bs = args.batch_size
@@ -211,16 +213,39 @@ def pretrain(args):
     
     with open(args.token_dict_path, 'rb') as f:
         token_dict = pickle.load(f)
-        
+    print(type(token_dict))
+    print(len(token_dict.items()))
     name_dict_path = os.path.join(args.prior_dir, "gene_list", "Gene_id_name_dict_human_mouse.pickle")
     with open(name_dict_path, 'rb') as f:
         id_to_name = pickle.load(f)
-    symbol_to_id = {str(name).upper(): str(ens_id) for ens_id, name in id_to_name.items()}
+    print(type(id_to_name))
+    print(list(id_to_name.items())[:5])
     
+    print("Building precise Cross-Species Symbol -> ID mapping...")
+    symbol_to_id = {}
+    for ens_id, name in id_to_name.items():
+        g_upper = str(name).upper()
+        ens_str = str(ens_id)
+        
+        # 策略：人类基因 (ENSG) 拥有最高优先级！
+        if ens_str.startswith("ENSG"):
+            # 如果是人类基因，直接写入或覆盖（抢夺同源基因的归属权）
+            symbol_to_id[g_upper] = ens_str
+        else:
+            # 如果是小鼠基因 (ENSMUSG等)
+            # 只有当这个基因名还没有被人类霸占时（即非同源的、小鼠特异性基因），才允许写入
+            if g_upper not in symbol_to_id:
+                symbol_to_id[g_upper] = ens_str
+                
+    print(f"Successfully built mapping for {len(symbol_to_id)} unique gene symbols.")
+    print(type(symbol_to_id))
+    print(list(symbol_to_id.items())[:5])
     base_vocab_size = len(token_dict)
     HUMAN_TOKEN_ID = base_vocab_size 
     MOUSE_TOKEN_ID = base_vocab_size + 1
     cfg.n_genes = base_vocab_size + 2 
+    print("cfg.n_genes")
+    print(cfg.n_genes)
     print(f"Total Vocabulary Size (including 2 Species Tokens): {cfg.n_genes}")
     
     MODEL_PATH = f"../model_checkpoint/immune_multispecies_pretrain"
@@ -274,7 +299,7 @@ def pretrain(args):
             zero_idx = batch['zero_idx'].to(cfg.device)
 
             # ==========================================================
-            # [核心修复] 保证所有序列的严格平移对齐，防止 Loss 爆炸
+            # 保证所有序列的严格平移对齐，防止 Loss 爆炸
             # ==========================================================
             nonz_gene[:, 1:] = nonz_gene[:, :-1].clone()
             dw_nzdata[:, 1:] = dw_nzdata[:, :-1].clone()
