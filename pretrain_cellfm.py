@@ -24,10 +24,16 @@ from model import Cell_FM
 class CrossSpeciesSCrna(Dataset):
     def __init__(self, adata):
         self.adata = adata
+        #self.species_ids = adata.obs['species_id'].values
         if not sp.issparse(self.adata.X):
             self.adata.X = sp.csr_matrix(self.adata.X)
         self.T = np.asarray(self.adata.X.sum(1)).ravel()
         self.gene = np.arange(self.adata.n_vars, dtype=np.int32)
+        global_species = 0 if "human" in str(adata.file_name if hasattr(adata, 'file_name') else "human").lower() else 1
+        if 'species_id' in adata.obs.columns:
+            self.species_ids = adata.obs['species_id'].values
+        else:
+            self.species_ids = np.full(adata.n_obs, global_species)
 
     def __len__(self):
         return self.adata.n_obs
@@ -35,7 +41,8 @@ class CrossSpeciesSCrna(Dataset):
     def __getitem__(self, idx):
         data = self.adata.X[idx].toarray().ravel().astype(np.float32)
         T = np.asarray(self.T[idx], dtype=np.float32)
-        return data, self.gene, T, 0, 0, 0.0
+        species_id = int(self.species_ids[idx])
+        return data, self.gene, T, species_id, 0, 0.0
   
 # ==========================================
 # 1. 跨物种基因对齐  Symbol->ID 翻译)
@@ -183,6 +190,14 @@ class CrossSpecies_Cell_FM(Cell_FM):
                 
             del torch_state_dict["gene_emb"]
 
+        if "cls_token" in torch_state_dict:
+            orig_cls = torch_state_dict["cls_token"].squeeze(0).squeeze(0) # 提取形状 [1536]
+            # 让人类(0)和小鼠(1)都继承官方的 CLS 初始化
+            self.net.species_embedding.weight.data[0] = orig_cls.clone()
+            self.net.species_embedding.weight.data[1] = orig_cls.clone()
+            del torch_state_dict["cls_token"]
+            
+
         self.net.load_state_dict(torch_state_dict, strict=False)
         
         orig_tensor = self.net.gene_emb.data.clone()
@@ -297,39 +312,29 @@ def pretrain(args):
             nonz_gene = batch['nonz_gene'].to(cfg.device)
             mask_gene = batch['mask_gene'].to(cfg.device)
             zero_idx = batch['zero_idx'].to(cfg.device)
-
-            # ==========================================================
-            # 保证所有序列的严格平移对齐，防止 Loss 爆炸
-            # ==========================================================
-            nonz_gene[:, 1:] = nonz_gene[:, :-1].clone()
-            dw_nzdata[:, 1:] = dw_nzdata[:, :-1].clone()
-            nonz_gene[:, 0] = HUMAN_TOKEN_ID if is_human else MOUSE_TOKEN_ID
-            dw_nzdata[:, 0] = 1.0 
-
-            raw_nzdata[:, 1:] = raw_nzdata[:, :-1].clone()
-            raw_nzdata[:, 0] = 1.0  
-
-            mask_gene[:, 1:] = mask_gene[:, :-1].clone()
-            mask_gene[:, 0] = 0.0  
-
-            zero_idx[:, 1:] = zero_idx[:, :-1].clone()
-            zero_idx[:, 0] = 1.0
-            # ==========================================================
-
+            # ====================================================
+            # # 从 batch 中提取 species_id
+            species_id = batch['celltype_label'].to(cfg.device)
+            
             optimizer.zero_grad()
             with torch.cuda.amp.autocast():
-                # 这里只返回总 loss，使用最原生的极简模式
-                loss, cls_token = net(
+                # 直接传 species_id 给网络
+                loss, _ = net(
                     raw_nzdata=raw_nzdata,
                     dw_nzdata=dw_nzdata,
                     ST_feat=ST_feat,
                     nonz_gene=nonz_gene,
                     mask_gene=mask_gene,
-                    zero_idx=zero_idx
+                    zero_idx=zero_idx,
+                    species_id=species_id
                 ) 
             
             scaler.scale(loss).backward()
+            
+            # 🛑 修复 AMP 梯度裁剪致命 Bug：必须先 unscale！
+            scaler.unscale_(optimizer) 
             nn.utils.clip_grad_norm_(net.parameters(), max_norm=1.0)
+            
             scaler.step(optimizer)
             scaler.update()
             
@@ -379,4 +384,3 @@ if __name__ == "__main__":
     parser.add_argument("--device", type=str, default='cuda:0')
     args = parser.parse_args()
     pretrain(args)
-    
