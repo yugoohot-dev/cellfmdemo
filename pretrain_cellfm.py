@@ -36,7 +36,7 @@ class CrossSpeciesSCrna(Dataset):
         data = self.adata.X[idx].toarray().ravel().astype(np.float32)
         T = np.asarray(self.T[idx], dtype=np.float32)
         return data, self.gene, T, 0, 0, 0.0
-
+  
 # ==========================================
 # 1. 跨物种基因对齐  Symbol->ID 翻译)
 # ==========================================
@@ -379,3 +379,4 @@ if __name__ == "__main__":
     parser.add_argument("--device", type=str, default='cuda:0')
     args = parser.parse_args()
     pretrain(args)
+    
