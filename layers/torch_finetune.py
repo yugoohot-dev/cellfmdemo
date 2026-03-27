@@ -70,11 +70,14 @@ class FinetuneModel(nn.Module):
 
         self.gene_emb = nn.Parameter(torch.empty(n_genes + 1 + (-n_genes - 1) % 8, cfg.enc_dims))
         self.ST_emb = nn.Parameter(torch.empty(1, 2, cfg.enc_dims))
-        self.cls_token = nn.Parameter(torch.empty(1, 1, cfg.enc_dims))
+        ################替换为 GeneCompass 风格的物种 Embedding（0代表Human，1代表Mouse）：
+        self.species_embedding = nn.Embedding(2, cfg.enc_dims)
+        nn.init.xavier_normal_(self.species_embedding.weight)
+        ######################
         self.zero_emb = nn.Parameter(torch.zeros(1, 1, cfg.enc_dims))
         nn.init.xavier_normal_(self.gene_emb)
         nn.init.xavier_normal_(self.ST_emb)
-        nn.init.xavier_normal_(self.cls_token)
+        #nn.init.xavier_normal_(self.cls_token)
         with torch.no_grad():
             self.gene_emb[0, :] = 0
 
@@ -150,7 +153,7 @@ class FinetuneModel(nn.Module):
         return expr_emb, gw_pred, cw_pred, loss1, nonz_gene_loss, gene_loss, total_loss
 
 
-    def encode(self, expr, gene, ST_feat, zero_idx):
+    def encode(self, expr, gene, ST_feat, zero_idx, species_id=None):
         b, l = gene.shape
         gene_emb = self.gene_emb[gene] 
         expr_emb, unmask = self.value_enc(expr)
@@ -168,7 +171,14 @@ class FinetuneModel(nn.Module):
         else:
             st_emb = self.ST_emb
             st_emb = st_emb.expand(b, -1, -1)
-        cls_token = self.cls_token.expand(b, -1, -1)
+        #cls_token = self.cls_token.expand(b, -1, -1)删除
+        ################修改为一下
+        if species_id is not None:
+            cls_token = self.species_embedding(species_id).unsqueeze(1) # [B, 1, D]
+        else:
+            # 兜底：如果没有传入，默认当作人类(0)
+            cls_token = self.species_embedding(torch.zeros(b, dtype=torch.long, device=expr.device)).unsqueeze(1)
+        ##############################
         expr_emb = torch.cat([cls_token, st_emb, expr_emb], dim=1)
         
         zero_idx = torch.cat([torch.ones((b, 3), device=zero_idx.device), zero_idx], dim=1)
@@ -191,8 +201,8 @@ class FinetuneModel(nn.Module):
         )
         return expr_emb, gene_emb
 
-    def forward(self, raw_nzdata, dw_nzdata, ST_feat, nonz_gene, mask_gene, zero_idx, *args):
-        emb, gene_emb = self.encode(dw_nzdata, nonz_gene, ST_feat, zero_idx)
+    def forward(self, raw_nzdata, dw_nzdata, ST_feat, nonz_gene, mask_gene, zero_idx, species_id=None, *args):
+        emb, gene_emb = self.encode(dw_nzdata, nonz_gene, ST_feat, zero_idx, species_id)
         
         cls_token, st_emb, expr_emb = emb[:, 0], emb[:, 1:3], emb[:, 3:]
         # expr_emb, gene_emb, cls_token = self.embedding_forward(dw_nzdata, nonz_gene, ST_feat, zero_idx)
@@ -362,4 +372,3 @@ if __name__ == '__main__':
     # restore_meta_to_torch(meta_info, optimizer)
     # =========================================================================
     # print(net)
-
