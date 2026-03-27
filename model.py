@@ -104,24 +104,14 @@ class Cell_FM(nn.Module):
             for param in optimizer.state:
                 optimizer.state[param]['step'] = step_tensor
 
-    def forward(self, raw_nzdata,
-                dw_nzdata,
-                ST_feat,
-                nonz_gene,
-                mask_gene,
-                zero_idx):
+    def forward(self, raw_nzdata, dw_nzdata, ST_feat, nonz_gene, mask_gene, zero_idx, species_id=None):
         
-        loss = self.net(raw_nzdata,
-                dw_nzdata,
-                ST_feat,
-                nonz_gene,
-                mask_gene,
-                zero_idx)
+        loss = self.net(raw_nzdata, dw_nzdata, ST_feat, nonz_gene, mask_gene, zero_idx, species_id)
         
-        emb, gene_emb= self.net.encode(dw_nzdata, nonz_gene, ST_feat, zero_idx)
-        cls_token, st_emb, expr_emb = emb[:, 0], emb[:, 1:3], emb[:, 3:]
+        #emb, gene_emb= self.net.encode(dw_nzdata, nonz_gene, ST_feat, zero_idx)
+        #cls_token, st_emb, expr_emb = emb[:, 0], emb[:, 1:3], emb[:, 3:]
 
-        return loss, cls_token
+        return loss, None#cls_token
     
 class Finetune_Cell_FM(nn.Module):
     def __init__(self, cfg):
