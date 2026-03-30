@@ -109,7 +109,9 @@ class FinetuneModel(nn.Module):
         expr_emb = gene_emb + expr_emb
 
         if ST_feat is None:
-            cls_token = self.cls_token.expand(b, -1, -1)
+            #cls_token = self.cls_token.expand(b, -1, -1)
+            # 兼容推理模式，默认当作人类(0)
+            cls_token = self.species_embedding(torch.zeros(b, dtype=torch.long, device=expr.device)).unsqueeze(1)
             expr_emb = torch.cat([cls_token, expr_emb], dim=1)
             zero_idx = torch.cat([torch.ones((b, 1), device=zero_idx.device), zero_idx], dim=1)
             if self.pad_zero:
@@ -372,3 +374,4 @@ if __name__ == '__main__':
     # restore_meta_to_torch(meta_info, optimizer)
     # =========================================================================
     # print(net)
+
