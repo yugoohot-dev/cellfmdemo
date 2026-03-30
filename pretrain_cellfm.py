@@ -256,9 +256,7 @@ def pretrain(args):
     print(type(symbol_to_id))
     print(list(symbol_to_id.items())[:5])
     base_vocab_size = len(token_dict)
-    HUMAN_TOKEN_ID = base_vocab_size 
-    MOUSE_TOKEN_ID = base_vocab_size + 1
-    cfg.n_genes = base_vocab_size + 2 
+    cfg.n_genes = base_vocab_size
     print("cfg.n_genes")
     print(cfg.n_genes)
     print(f"Total Vocabulary Size (including 2 Species Tokens): {cfg.n_genes}")
@@ -295,6 +293,8 @@ def pretrain(args):
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.epoch) 
     
     is_human = "human" in args.data_path.lower() 
+    if 'species_id' not in adata.obs.columns:
+        adata.obs['species_id'] = 0 if is_human else 1
 
     # [新增] 收集 Loss 的列表
     step_losses = []
