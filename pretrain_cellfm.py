@@ -22,14 +22,14 @@ from model import Cell_FM
 # 0. 自定义跨物种数据加载器 (绕过底层的硬编码基因过滤)
 # ==========================================
 class CrossSpeciesSCrna(Dataset):
-    def __init__(self, adata):
+    def __init__(self, adata, global_species=0): # 增加 global_species 参数
         self.adata = adata
-        #self.species_ids = adata.obs['species_id'].values
         if not sp.issparse(self.adata.X):
             self.adata.X = sp.csr_matrix(self.adata.X)
         self.T = np.asarray(self.adata.X.sum(1)).ravel()
         self.gene = np.arange(self.adata.n_vars, dtype=np.int32)
-        global_species = 0 if "human" in str(adata.file_name if hasattr(adata, 'file_name') else "human").lower() else 1
+
+        # 直接使用外部传进来的 global_species
         if 'species_id' in adata.obs.columns:
             self.species_ids = adata.obs['species_id'].values
         else:
@@ -51,6 +51,8 @@ def align_cross_species_adata(adata, token_dict, base_vocab_size, symbol_to_id):
     print(f"Original adata shape: {adata.shape}")
     X_orig = adata.X.tocsc() if sp.issparse(adata.X) else sp.csc_matrix(adata.X)
     new_X = sp.lil_matrix((adata.n_obs, base_vocab_size), dtype=np.float32)
+    print("词表维度")
+    print(new_X.shape)
     
     matched = 0
     for i, gene in enumerate(adata.var_names):
@@ -153,62 +155,90 @@ class CrossSpecies_Cell_FM(Cell_FM):
         
     def load_weight_and_surgery(self, prior_matrix):
         import mindspore as ms
-        print(f"Loading base checkpoint from {self.ckpt_path} ...")
-        self.ms_ckpt = ms.load_checkpoint(self.ckpt_path)
         
-        torch_state_dict = {}
-        for ms_key, ms_param in self.ms_ckpt.items():
-            pt_key = self.map_ms_to_pt(ms_key)
-            if not pt_key.startswith("moment") and pt_key not in ['global_step', 'learning_rate']:
-                torch_state_dict[pt_key] = torch.tensor(ms_param.asnumpy())
-                
-        if "gene_emb" in torch_state_dict:
-            old_emb = torch_state_dict["gene_emb"]
-            new_emb = self.net.gene_emb.data 
-            
-            # [核心修复] 精确词表对齐映射
-            matched_weights = 0
-            csv_path = 'csv/expand_gene_info.csv'
-            if os.path.exists(csv_path):
-                cellfm_gene_info = pd.read_csv(csv_path, index_col=0, header=0)
-                cellfm_geneset = {str(j).upper(): i + 1 for i, j in enumerate(cellfm_gene_info.index)}
-                
-                for cellfm_symbol, cellfm_id in cellfm_geneset.items():
-                    if cellfm_id >= old_emb.shape[0]: continue
-                    ensembl_id = self.symbol_to_id.get(cellfm_symbol, cellfm_symbol)
-                    
-                    if ensembl_id in self.token_dict:
-                        new_token_id = self.token_dict[ensembl_id]
-                        if new_token_id < new_emb.shape[0]:
-                            new_emb[new_token_id, :] = old_emb[cellfm_id, :]
-                            matched_weights += 1
-                print(f"[Surgery] Precise Vocabulary Alignment: Transferred {matched_weights} gene embeddings safely.")
-            else:
-                print("WARNING: expand_gene_info.csv NOT FOUND! Using sequential copy.")
-                copy_len = min(old_emb.shape[0], new_emb.shape[0])
-                new_emb[:copy_len, :] = old_emb[:copy_len, :]
-                
-            del torch_state_dict["gene_emb"]
-
-        if "cls_token" in torch_state_dict:
-            orig_cls = torch_state_dict["cls_token"].squeeze(0).squeeze(0) # 提取形状 [1536]
-            # 让人类(0)和小鼠(1)都继承官方的 CLS 初始化
-            self.net.species_embedding.weight.data[0] = orig_cls.clone()
-            self.net.species_embedding.weight.data[1] = orig_cls.clone()
-            del torch_state_dict["cls_token"]
-            
-
-        self.net.load_state_dict(torch_state_dict, strict=False)
-        
+        # ==========================================
+        # 1. 无论哪种加载方式，先搭好我们的外挂架构骨架
+        # ==========================================
         orig_tensor = self.net.gene_emb.data.clone()
         del self.net.gene_emb
         
+        # 对齐先验矩阵尺寸，防止底层 Padding 词汇导致索引越界
+        full_prior_matrix = torch.zeros((orig_tensor.shape[0], prior_matrix.shape[1]))
+        full_prior_matrix[:prior_matrix.shape[0], :] = prior_matrix
+        
+        # 挂载包含了生物学先验的 Embedding 层
         self.net.gene_emb = PriorAugmentedEmbedding(
             orig_tensor, 
-            prior_matrix.to(self.cfg.device), 
+            full_prior_matrix.to(self.cfg.device), 
             self.cfg.enc_dims
         ).to(self.cfg.device)
-        print("[Surgery] Prior Knowledge mapping network successfully attached.")
+
+        if self.ckpt_path is None:
+            print("No checkpoint provided. Training from scratch.")
+            return
+
+        # ==========================================
+        # 场景 A: 首次训练 (加载官方 MindSpore 基础权重)
+        # ==========================================
+        if self.ckpt_path.endswith('.ckpt'):
+            print(f"Loading Base Checkpoint from {self.ckpt_path} ...")
+            self.ms_ckpt = ms.load_checkpoint(self.ckpt_path)
+            
+            torch_state_dict = {}
+            for ms_key, ms_param in self.ms_ckpt.items():
+                pt_key = self.map_ms_to_pt(ms_key)
+                if not pt_key.startswith("moment") and pt_key not in ['global_step', 'learning_rate']:
+                    torch_state_dict[pt_key] = torch.tensor(ms_param.asnumpy())
+                    
+            # 1. 基因特征的精准移植
+            if "gene_emb" in torch_state_dict:
+                old_emb = torch_state_dict["gene_emb"]
+                # 注意：此时网络结构已经是 PriorAugmented，所以我们要往它的 base_emb 里灌数据
+                new_emb = self.net.gene_emb.base_emb.data 
+                
+                matched_weights = 0
+                csv_path = 'csv/expand_gene_info.csv'
+                if os.path.exists(csv_path):
+                    cellfm_gene_info = pd.read_csv(csv_path, index_col=0, header=0)
+                    cellfm_geneset = {str(j).upper(): i + 1 for i, j in enumerate(cellfm_gene_info.index)}
+                    
+                    for cellfm_symbol, cellfm_id in cellfm_geneset.items():
+                        if cellfm_id >= old_emb.shape[0]: continue
+                        ensembl_id = self.symbol_to_id.get(cellfm_symbol, cellfm_symbol)
+                        
+                        if ensembl_id in self.token_dict:
+                            new_token_id = self.token_dict[ensembl_id]
+                            if new_token_id < new_emb.shape[0]:
+                                new_emb[new_token_id, :] = old_emb[cellfm_id, :]
+                                matched_weights += 1
+                    print(f"[Surgery] Precise Vocabulary Alignment: Transferred {matched_weights} gene embeddings safely.")
+                del torch_state_dict["gene_emb"]
+
+            # 2. 物种特征 (cls_token) 的提取与复制
+            if "cls_token" in torch_state_dict:
+                orig_cls = torch_state_dict["cls_token"].squeeze(0).squeeze(0)
+                # 让人类(0)和小鼠(1)都以这个官方高级特征作为起点
+                self.net.species_embedding.weight.data[0] = orig_cls.clone()
+                self.net.species_embedding.weight.data[1] = orig_cls.clone()
+                del torch_state_dict["cls_token"]
+
+            self.net.load_state_dict(torch_state_dict, strict=False)
+            print("[Surgery] Base model loaded and aligned. Ready for continual training.")
+
+        # ==========================================
+        # 场景 B: 断点续训 (加载我们自己保存的 PyTorch 权重)
+        # ==========================================
+        elif self.ckpt_path.endswith('.pth'):
+            print(f"Resuming continual training from {self.ckpt_path} ...")
+            # 因为是 .pth，它本身就已经是一个字典了，直接加载
+            pt_state_dict = torch.load(self.ckpt_path, map_location='cpu')
+            
+            # 使用 strict=False 加载，因为不需要强制更新 prior_matrix 这种固定特征
+            self.net.load_state_dict(pt_state_dict, strict=False)
+            print("[Resume] PyTorch model loaded successfully. Original cls_token surgery skipped to preserve learned species features.")
+        
+        else:
+            raise ValueError("Unsupported checkpoint format. Must be .ckpt or .pth")
 
 # ==========================================
 # 5. 主预训练流程
@@ -269,7 +299,12 @@ def pretrain(args):
     adata = align_cross_species_adata(adata, token_dict, base_vocab_size, symbol_to_id)
     
     # [核心修复] 使用自定义数据集类，保留全长跨物种特征矩阵
-    dataset = CrossSpeciesSCrna(adata)
+    # 提前判定是人还是鼠
+    is_human = "human" in args.data_path.lower()
+    global_species_val = 0 if is_human else 1
+
+    # 传给 Dataset
+    dataset = CrossSpeciesSCrna(adata, global_species=global_species_val)
     
     prep = Prepare(cfg.nonz_len, pad=0, mask_ratio=cfg.mask_ratio)
     train_loader = build_dataset(dataset, prep=prep, batch_size=cfg.use_bs, pad_zero=cfg.pad_zero, drop=True, shuffle=True)
