@@ -203,9 +203,11 @@ class FinetuneModel(nn.Module):
         )
         return expr_emb, gene_emb
 
-    def forward(self, raw_nzdata, dw_nzdata, ST_feat, nonz_gene, mask_gene, zero_idx, species_id=None, *args):
-        emb, gene_emb = self.encode(dw_nzdata, nonz_gene, ST_feat, zero_idx, species_id)
-        
+    def forward(self, raw_nzdata, dw_nzdata, ST_feat, nonz_gene, mask_gene, zero_idx, species_id=None, injected_gene_emb=None):
+        if injected_gene_emb is not None:
+            gene_emb = injected_gene_emb
+        else:
+            emb, gene_emb = self.encode(dw_nzdata, nonz_gene, ST_feat, zero_idx)
         cls_token, st_emb, expr_emb = emb[:, 0], emb[:, 1:3], emb[:, 3:]
         # expr_emb, gene_emb, cls_token = self.embedding_forward(dw_nzdata, nonz_gene, ST_feat, zero_idx)
 
