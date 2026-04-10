@@ -70,61 +70,36 @@ def align_cross_species_adata(adata, token_dict, base_vocab_size, symbol_to_id):
     new_adata.var_names = [str(i) for i in range(base_vocab_size)] 
     return new_adata
 
-# ==========================================
-# 2. 先验知识矩阵构建
+# 1. 重构先验知识矩阵 (仅包含 Promoter + Family)
 # ==========================================
 def build_prior_knowledge_matrix(token_dict, prior_dir, vocab_size, id_to_name):
-    print("Building Prior Knowledge Matrix...")
-    prior_dim = 768 * 4
-    prior_matrix = torch.zeros(vocab_size, prior_dim)
+    print("Building Universal Prior Knowledge Matrix (Promoter 768 + Gene Family 768)...")
+    prior_matrix = torch.zeros(vocab_size, 1536) # 1536维
     
-    def load_pk(path):
-        full_path = os.path.join(prior_dir, path)
-        if not os.path.exists(full_path):
-            return {}
-        with open(full_path, 'rb') as f:
-            return pickle.load(f)
+    def load_pk(filename):
+        path = os.path.join(prior_dir, filename)
+        return pickle.load(open(path, 'rb')) if os.path.exists(path) else {}
 
-    h_peca = load_pk("PECA2vec/human_PECA_vec.pickle")
-    m_peca = load_pk("PECA2vec/mouse_PECA_vec.pickle")
-    h_prom = load_pk("promoter_emb/human_emb_768.pickle")
-    m_prom = load_pk("promoter_emb/mouse_emb_768.pickle")
-    h_fam = load_pk("gene_family/Human_dim_768_gene_28291_random.pickle")
-    m_fam = load_pk("gene_family/Mouse_dim_768_gene_27934_random.pickle")
-    h_co = load_pk("gene_co_express_emb/Human_dim_768_gene_28291_random.pickle")
-    m_co = load_pk("gene_co_express_emb/Mouse_dim_768_gene_27444_random.pickle")
+    # 加载你的 6 大物种启动子与家族先验
+    prom_all = {
+        **load_pk("human_promoter_emb_768.pickle"), **load_pk("mouse_promoter_emb_768.pickle"),
+        **load_pk("zebrafish_promoter_emb_768.pickle"), **load_pk("chicken_promoter_emb_768.pickle"),
+        **load_pk("frog_promoter_emb_768.pickle"), **load_pk("macaque_promoter_emb_768.pickle")
+    }
+    fam_all = load_pk("universal_gene_family_emb_768.pickle")
     
-    peca_all = {**h_peca, **m_peca}
-    prom_all = {**h_prom, **m_prom}
-    fam_all = {**h_fam, **m_fam}
-    co_all = {**h_co, **m_co}
-    
-    matched = 0
     for gene_id, token_id in token_dict.items():
         if token_id >= vocab_size: continue
         
-        symbol = str(id_to_name.get(gene_id, ""))
-        candidates = [gene_id, symbol, symbol.upper(), symbol.capitalize()]
+        emb_prom = prom_all.get(gene_id, torch.randn(768) * 0.02)
+        emb_fam  = fam_all.get(gene_id, torch.randn(768) * 0.02)
         
-        def get_emb(pk_dict):
-            for k in candidates:
-                if k and k in pk_dict:
-                    val = pk_dict[k]
-                    if isinstance(val, torch.Tensor): return val.clone().detach().float()
-                    else: return torch.tensor(val, dtype=torch.float32)
-            return torch.zeros(768, dtype=torch.float32)
+        if not isinstance(emb_prom, torch.Tensor): emb_prom = torch.tensor(emb_prom)
+        if not isinstance(emb_fam, torch.Tensor): emb_fam = torch.tensor(emb_fam)
+            
+        prior_matrix[token_id] = torch.cat([emb_prom.float(), emb_fam.float()])
         
-        emb_peca = get_emb(peca_all)
-        emb_prom = get_emb(prom_all)
-        emb_fam  = get_emb(fam_all)
-        emb_co   = get_emb(co_all)
-        
-        cat_emb = torch.cat([emb_peca, emb_prom, emb_fam, emb_co])
-        if cat_emb.abs().sum() > 0:
-            matched += 1
-        prior_matrix[token_id] = cat_emb
-        
-    print(f"Prior Knowledge Builder: Successfully matched features for {matched} genes.")
+    print("✅ Prior Matrix Built!")
     return prior_matrix
 
 # ==========================================
@@ -144,101 +119,95 @@ class PriorAugmentedEmbedding(nn.Module):
         return self.ln(base + prior)
 
 # ==========================================
-# 4. 扩容与外挂融合模型
+# 同源权重克隆外科手术与断点续训管理器
 # ==========================================
 class CrossSpecies_Cell_FM(Cell_FM):
-    # [修改] 增加 token_dict 和 symbol_to_id，用于精确权重寻址
-    def __init__(self, n_gene, cfg, ckpt_path=None, device=None, token_dict=None, symbol_to_id=None):
+    def __init__(self, n_gene, cfg, ckpt_path=None, device=None, token_dict=None, symbol_to_id=None, ortholog_dict=None):
         super().__init__(n_gene, cfg, ckpt_path, device)
         self.token_dict = token_dict
         self.symbol_to_id = symbol_to_id
+        self.ortholog_dict = ortholog_dict # 格式：{非人基因ID: 人类同源ID}
         
     def load_weight_and_surgery(self, prior_matrix):
         import mindspore as ms
         
-        # ==========================================
-        # 1. 无论哪种加载方式，先搭好我们的外挂架构骨架
-        # ==========================================
+        # 1. 无论哪种情况，必须先挂载 1536 维先验特征外挂骨架 (组装好网络结构)
         orig_tensor = self.net.gene_emb.data.clone()
         del self.net.gene_emb
+        full_prior = torch.zeros((orig_tensor.shape[0], prior_matrix.shape[1]))
+        full_prior[:prior_matrix.shape[0], :] = prior_matrix
         
-        # 对齐先验矩阵尺寸，防止底层 Padding 词汇导致索引越界
-        full_prior_matrix = torch.zeros((orig_tensor.shape[0], prior_matrix.shape[1]))
-        full_prior_matrix[:prior_matrix.shape[0], :] = prior_matrix
-        
-        # 挂载包含了生物学先验的 Embedding 层
+        # 挂载拦截式先验
         self.net.gene_emb = PriorAugmentedEmbedding(
-            orig_tensor, 
-            full_prior_matrix.to(self.cfg.device), 
-            self.cfg.enc_dims
+            orig_tensor, full_prior.to(self.cfg.device), self.cfg.enc_dims
         ).to(self.cfg.device)
 
-        if self.ckpt_path is None:
+        if not self.ckpt_path: 
             print("No checkpoint provided. Training from scratch.")
             return
 
         # ==========================================
-        # 场景 A: 首次训练 (加载官方 MindSpore 基础权重)
+        # 场景 A: 首次训练，加载 MindSpore 预训练底座进行外科手术
         # ==========================================
         if self.ckpt_path.endswith('.ckpt'):
             print(f"Loading Base Checkpoint from {self.ckpt_path} ...")
             self.ms_ckpt = ms.load_checkpoint(self.ckpt_path)
-            
-            torch_state_dict = {}
-            for ms_key, ms_param in self.ms_ckpt.items():
-                pt_key = self.map_ms_to_pt(ms_key)
-                if not pt_key.startswith("moment") and pt_key not in ['global_step', 'learning_rate']:
-                    torch_state_dict[pt_key] = torch.tensor(ms_param.asnumpy())
+            torch_state_dict = {self.map_ms_to_pt(k): torch.tensor(v.asnumpy()) 
+                                for k, v in self.ms_ckpt.items() if not self.map_ms_to_pt(k).startswith("moment")}
                     
-            # 1. 基因特征的精准移植
             if "gene_emb" in torch_state_dict:
                 old_emb = torch_state_dict["gene_emb"]
-                # 注意：此时网络结构已经是 PriorAugmented，所以我们要往它的 base_emb 里灌数据
                 new_emb = self.net.gene_emb.base_emb.data 
                 
-                matched_weights = 0
+                # 步骤 A：复原人类基础基因的权重
+                human_id_to_old_idx = {}
                 csv_path = 'csv/expand_gene_info.csv'
                 if os.path.exists(csv_path):
+                    import pandas as pd
                     cellfm_gene_info = pd.read_csv(csv_path, index_col=0, header=0)
-                    cellfm_geneset = {str(j).upper(): i + 1 for i, j in enumerate(cellfm_gene_info.index)}
-                    
-                    for cellfm_symbol, cellfm_id in cellfm_geneset.items():
+                    for i, cellfm_symbol in enumerate(cellfm_gene_info.index):
+                        cellfm_id = i + 1
                         if cellfm_id >= old_emb.shape[0]: continue
-                        ensembl_id = self.symbol_to_id.get(cellfm_symbol, cellfm_symbol)
+                        ensembl_id = self.symbol_to_id.get(str(cellfm_symbol).upper(), None)
                         
-                        if ensembl_id in self.token_dict:
+                        if ensembl_id and ensembl_id in self.token_dict:
                             new_token_id = self.token_dict[ensembl_id]
                             if new_token_id < new_emb.shape[0]:
                                 new_emb[new_token_id, :] = old_emb[cellfm_id, :]
-                                matched_weights += 1
-                    print(f"[Surgery] Precise Vocabulary Alignment: Transferred {matched_weights} gene embeddings safely.")
+                                human_id_to_old_idx[ensembl_id] = cellfm_id
+                                
+                # 步骤 B：同源基因权重克隆 (Homologous Surgery)
+                surgery_count = 0
+                if self.ortholog_dict:
+                    for other_id, human_id in self.ortholog_dict.items():
+                        if other_id in self.token_dict and human_id in human_id_to_old_idx:
+                            new_idx = self.token_dict[other_id]
+                            old_idx = human_id_to_old_idx[human_id]
+                            # 直接克隆人类的参数作为该物种同源基因的初始化点
+                            new_emb[new_idx, :] = old_emb[old_idx, :]
+                            surgery_count += 1
+                    print(f"🧬 Homologous Surgery: Safely cloned weights for {surgery_count} ortholog genes!")
+
                 del torch_state_dict["gene_emb"]
 
-            # 2. 物种特征 (cls_token) 的提取与复制
-            if "cls_token" in torch_state_dict:
-                orig_cls = torch_state_dict["cls_token"].squeeze(0).squeeze(0)
-                # 让人类(0)和小鼠(1)都以这个官方高级特征作为起点
-                self.net.species_embedding.weight.data[0] = orig_cls.clone()
-                self.net.species_embedding.weight.data[1] = orig_cls.clone()
-                del torch_state_dict["cls_token"]
-
+            # 【关键区别】：如果是 ckpt，我们只用它初始化 backbone (self.net)
+            # MoE 和 对比学习的参数此时是干净的随机初始化状态
             self.net.load_state_dict(torch_state_dict, strict=False)
-            print("[Surgery] Base model loaded and aligned. Ready for continual training.")
+            print("✅ [Init] Base model loaded and ortholog surgery completed.")
 
         # ==========================================
-        # 场景 B: 断点续训 (加载我们自己保存的 PyTorch 权重)
+        # 场景 B: 断点续训，加载 PyTorch (.pth) 恢复训练
         # ==========================================
         elif self.ckpt_path.endswith('.pth'):
-            print(f"Resuming continual training from {self.ckpt_path} ...")
-            # 因为是 .pth，它本身就已经是一个字典了，直接加载
+            print(f"🚀 Resuming continual training from checkpoint: {self.ckpt_path} ...")
             pt_state_dict = torch.load(self.ckpt_path, map_location='cpu')
             
-            # 使用 strict=False 加载，因为不需要强制更新 prior_matrix 这种固定特征
-            self.net.load_state_dict(pt_state_dict, strict=False)
-            print("[Resume] PyTorch model loaded successfully. Original cls_token surgery skipped to preserve learned species features.")
-        
-        else:
-            raise ValueError("Unsupported checkpoint format. Must be .ckpt or .pth")
+            # 【关键区别】：使用 self.load_state_dict 直接加载整个大模型！
+            # 这不仅会恢复微调过的特征，还会完美恢复 gene_moe 和 cell_moe 的路由权重。
+            # strict=False 用于忽略由于固定 prior_matrix 导致的多余/缺失 key 警告。
+            self.load_state_dict(pt_state_dict, strict=False)
+            
+            print("✅ [Resume] Model states (including MoE routers & tuned embeddings) fully restored.")
 
 # ==========================================
 # 5. 主预训练流程
@@ -263,33 +232,43 @@ def pretrain(args):
     name_dict_path = os.path.join(args.prior_dir, "gene_list", "Gene_id_name_dict_human_mouse.pickle")
     with open(name_dict_path, 'rb') as f:
         id_to_name = pickle.load(f)
-    print(type(id_to_name))
-    print(list(id_to_name.items())[:5])
+    print("Building Species-Specific & Human Global Mappings...")
+    is_human = "human" in args.data_path.lower()
     
-    print("Building precise Cross-Species Symbol -> ID mapping...")
-    symbol_to_id = {}
+    symbol_to_id = {}          # 专用于当前数据集对齐的 Symbol -> 独立物种 Ensembl 映射
+    symbol_to_ens_human = {}   # 专用于基座权重定位的 Symbol -> 人类 ENSG 映射
+    
     for ens_id, name in id_to_name.items():
         g_upper = str(name).upper()
         ens_str = str(ens_id)
         
-        # 策略：人类基因 (ENSG) 拥有最高优先级！
+        # 1. 建立基准人类参考系（为了上面的权重寻找）
         if ens_str.startswith("ENSG"):
-            # 如果是人类基因，直接写入或覆盖（抢夺同源基因的归属权）
+            symbol_to_ens_human[g_upper] = ens_str
+            
+        # 2. 建立物种隔离的数据集映射器 (彻底保留跨物种差异，不发生人类强制覆盖)
+        if is_human and ens_str.startswith("ENSG"):
             symbol_to_id[g_upper] = ens_str
-        else:
-            # 如果是小鼠基因 (ENSMUSG等)
-            # 只有当这个基因名还没有被人类霸占时（即非同源的、小鼠特异性基因），才允许写入
-            if g_upper not in symbol_to_id:
-                symbol_to_id[g_upper] = ens_str
-                
-    print(f"Successfully built mapping for {len(symbol_to_id)} unique gene symbols.")
-    print(type(symbol_to_id))
-    print(list(symbol_to_id.items())[:5])
+        elif not is_human and not ens_str.startswith("ENSG"):
+            # 匹配 ENSMUSG, ENSDARG 等
+            symbol_to_id[g_upper] = ens_str
+
+    print(f"Successfully built mapping for {len(symbol_to_id)} dataset-specific genes.")
+
+    # 3. 加载所有非人物种到人类的同源字典 (用于权重传染)
+    homology_dict = {}
+    homo_path = "mouse2human_ensembl.pkl" # 这里利用了你已有的文件
+    if os.path.exists(homo_path):
+        with open(homo_path, 'rb') as f:
+            homology_dict = pickle.load(f)
+        print(f"Loaded {len(homology_dict)} homologous pairs for zero-shot weight transfer.")
+
     base_vocab_size = len(token_dict)
     cfg.n_genes = base_vocab_size
-    print("cfg.n_genes")
-    print(cfg.n_genes)
     print(f"Total Vocabulary Size (including 2 Species Tokens): {cfg.n_genes}")
+    
+    # ... 后续加载数据adata逻辑不变 ...
+    
     
     MODEL_PATH = f"../model_checkpoint/immune_multispecies_pretrain"
     os.makedirs(MODEL_PATH, exist_ok=True)
@@ -312,8 +291,18 @@ def pretrain(args):
     prior_matrix = build_prior_knowledge_matrix(token_dict, args.prior_dir, cfg.n_genes, id_to_name)
     
     # 初始化模型时传入字典
-    net = CrossSpecies_Cell_FM(cfg.n_genes, cfg, ckpt_path=cfg.ckpt_path, device=cfg.device, token_dict=token_dict, symbol_to_id=symbol_to_id) 
+    # 初始化模型时，将新的字典全部注入进去
+    net = CrossSpecies_Cell_FM(
+        cfg.n_genes, cfg, 
+        ckpt_path=cfg.ckpt_path, 
+        device=cfg.device, 
+        token_dict=token_dict, 
+        symbol_to_id=symbol_to_id,               # 数据对齐映射
+        symbol_to_ens_human=symbol_to_ens_human, # 权重定位锚点
+        homology_dict=homology_dict              # 一对一同源投射桥梁
+    )
     net.load_weight_and_surgery(prior_matrix)  
+    
     net = net.to(cfg.device)
     
     # 静态先验知识矩阵不被解冻参与梯度计算
