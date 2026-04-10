@@ -88,11 +88,34 @@ def build_prior_knowledge_matrix(token_dict, prior_dir, vocab_size, id_to_name):
     }
     fam_all = load_pk("universal_gene_family_emb_768.pickle")
     
-    for gene_id, token_id in token_dict.items():
+    
+    
+
+
+    # 建立反向字典 Symbol -> ENSG
+    name_to_id = {str(v).upper(): k for k, v in id_to_name.items()}
+    
+    for gene_key, token_id in token_dict.items():
         if token_id >= vocab_size: continue
         
-        emb_prom = prom_all.get(gene_id, torch.randn(768) * 0.02)
-        emb_fam  = fam_all.get(gene_id, torch.randn(768) * 0.02)
+        # 1. 拆出前缀和纯净符号 (如: gene_key="MAC_GAPDH" -> prefix="MAC_", pure_symbol="GAPDH")
+        if '_' in gene_key:
+            prefix, pure_symbol = gene_key.split('_', 1)
+            prefix = prefix + '_'
+        else:
+            prefix = ""
+            pure_symbol = gene_key
+            
+        # 2. 映射回原始 ID（如果是 Symbol 就转为 ENSG，否则保持原样）
+        raw_id = name_to_id.get(pure_symbol, pure_symbol)
+        
+        # 3. 带上前缀，去你生成的超级启动子字典里精准打捞特征！
+        query_key = f"{prefix}{raw_id}"
+        
+        emb_prom = prom_all.get(query_key, torch.randn(768) * 0.02)
+        emb_fam  = fam_all.get(query_key, torch.randn(768) * 0.02)
+
+
         
         if not isinstance(emb_prom, torch.Tensor): emb_prom = torch.tensor(emb_prom)
         if not isinstance(emb_fam, torch.Tensor): emb_fam = torch.tensor(emb_fam)
